@@ -6,6 +6,12 @@ import time
 import threading
 import winsound
 import math
+import json
+import os
+import pystray
+from PIL import Image, ImageDraw
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rage_settings.json')
 
 # --- Windows API Definitions ---
 user32 = ctypes.windll.user32
@@ -75,6 +81,13 @@ class RageApp:
         self.last_key_time = time.time()
         self.shake_offset = (0, 0)
         
+        # Settings (load from file or use defaults)
+        self.load_settings()
+        
+        # System Tray
+        self.tray_icon = None
+        threading.Thread(target=self.setup_tray, daemon=True).start()
+        
         # Keys to monitor (Simple polling for A-Z, Space, Enter)
         self.keys_to_poll = [i for i in range(0x41, 0x5A + 1)] # A-Z
         self.keys_to_poll.extend([0x20, 0x0D, 0x08]) # Space, Enter, Backspace
@@ -98,32 +111,130 @@ class RageApp:
         style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
-    def quit(self, event):
+    def load_settings(self):
+        # Defaults
+        self.sound_enabled = True
+        self.shake_enabled = True
+        self.fire_enabled = True
+        self.volume_level = 0.5  # Default 50%
+        
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.sound_enabled = data.get('sound_enabled', True)
+                    self.shake_enabled = data.get('shake_enabled', True)
+                    self.fire_enabled = data.get('fire_enabled', True)
+                    self.volume_level = data.get('volume_level', 0.5)
+        except:
+            pass
+
+    def save_settings(self):
+        try:
+            data = {
+                'sound_enabled': self.sound_enabled,
+                'shake_enabled': self.shake_enabled,
+                'fire_enabled': self.fire_enabled,
+                'volume_level': self.volume_level
+            }
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(data, f)
+        except:
+            pass
+
+    def quit(self, event=None):
         self.running = False
+        if self.tray_icon:
+            self.tray_icon.stop()
         self.root.destroy()
 
+    def setup_tray(self):
+        image = self.create_tray_image()
+        
+        volume_menu = pystray.Menu(
+            pystray.MenuItem("100%", lambda: self.set_volume(1.0), checked=lambda item: self.volume_level == 1.0),
+            pystray.MenuItem("75%", lambda: self.set_volume(0.75), checked=lambda item: self.volume_level == 0.75),
+            pystray.MenuItem("50%", lambda: self.set_volume(0.5), checked=lambda item: self.volume_level == 0.5),
+            pystray.MenuItem("25%", lambda: self.set_volume(0.25), checked=lambda item: self.volume_level == 0.25),
+            pystray.MenuItem("Mute", lambda: self.set_volume(0.0), checked=lambda item: self.volume_level == 0.0),
+        )
+        
+        menu = pystray.Menu(
+            pystray.MenuItem(
+                "Sound",
+                self.toggle_sound,
+                checked=lambda item: self.sound_enabled
+            ),
+            pystray.MenuItem("Volume", volume_menu),
+            pystray.MenuItem(
+                "Shake",
+                self.toggle_shake,
+                checked=lambda item: self.shake_enabled
+            ),
+            pystray.MenuItem(
+                "Fire",
+                self.toggle_fire,
+                checked=lambda item: self.fire_enabled
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", self.quit_from_tray)
+        )
+        self.tray_icon = pystray.Icon("RageMode", image, "Rage Mode", menu)
+        self.tray_icon.run()
+
+    def create_tray_image(self):
+        size = 64
+        image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse([16, 24, 48, 60], fill='#ff4500')
+        draw.ellipse([20, 16, 44, 48], fill='#ff8c00')
+        draw.ellipse([24, 8, 40, 36], fill='#ffcc00')
+        return image
+
+    def set_volume(self, level):
+        self.volume_level = level
+        self.save_settings()
+
+    def toggle_sound(self):
+        self.sound_enabled = not self.sound_enabled
+        self.save_settings()
+
+    def toggle_shake(self):
+        self.shake_enabled = not self.shake_enabled
+        self.save_settings()
+
+    def toggle_fire(self):
+        self.fire_enabled = not self.fire_enabled
+        self.save_settings()
+
+    def quit_from_tray(self):
+        self.running = False
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
+
     def play_sound(self, filename):
+        if not self.sound_enabled or self.volume_level == 0.0:
+            return
+        volume = self.volume_level  # Capture current volume
         def sound_worker():
             alias = f"sound_{random.randint(0, 1000000)}"
-            # Use absolute path or relative? Relative to CWD is safer if run from there.
-            # But mci often needs full paths or standard paths.
-            # Let's try relative first, if fails we get full path.
             import os
             filepath = os.path.abspath(filename)
             
-            # Open
-            cmd_open = f'open "{filepath}" type mpegvideo alias {alias}'
-            user32 = ctypes.windll.user32
             winmm = ctypes.windll.winmm
             
-            # Send string signature: LPCWSTR, LPWSTR, UINT, HWND
+            # Open
+            cmd_open = f'open "{filepath}" type mpegvideo alias {alias}'
             winmm.mciSendStringW(cmd_open, None, 0, 0)
+            
+            # Set volume (0-1000 scale)
+            vol = int(volume * 1000)
+            winmm.mciSendStringW(f'setaudio {alias} volume to {vol}', None, 0, 0)
             
             # Play
             winmm.mciSendStringW(f'play {alias}', None, 0, 0)
             
-            # Wait for approx duration then close? 
-            # Or just wait a safe amount (2 sec) then cleanup
             time.sleep(1.0) 
             winmm.mciSendStringW(f'close {alias}', None, 0, 0)
 
@@ -196,6 +307,8 @@ class RageApp:
         self.trigger_shake(force=is_uppercase)
 
     def trigger_shake(self, force=False):
+        if not self.shake_enabled:
+            return
         # Screen shake intensity based on rage
         intensity = min(30, 8 + self.rage_meter / 4)
         
@@ -207,8 +320,6 @@ class RageApp:
         self.root.after(50, lambda: setattr(self, 'shake_offset', (0,0)))
         
         # 2. Shake the ACTUAL ACTIVE WINDOW (physical)
-        # Verify drift is fixed logic is present below...
-        # Force shake if uppercase, even if rage is low
         if force or self.rage_meter > 20:
              self.shake_active_window(intensity)
 
@@ -260,6 +371,8 @@ class RageApp:
             self.active_shakes[hwnd]['timer'] = timer_id
 
     def spawn_explosion(self, x, y, intensity_mult=1.0):
+        if not self.fire_enabled:
+            return
         if x is None:
             caret = get_caret_position()
             if caret:
